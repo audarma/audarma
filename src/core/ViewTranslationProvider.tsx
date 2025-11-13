@@ -85,15 +85,30 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
     throw new Error('ViewTranslationProvider must be used within AudarProvider');
   }
 
-  const locale = config.i18n.getCurrentLocale();
+  // Track current locale reactively - call getCurrentLocale() on every render
+  // to detect when user switches languages
+  const [currentLocale, setCurrentLocale] = useState(() => config.i18n.getCurrentLocale());
   const defaultLocale = config.defaultLocale || config.i18n.getDefaultLocale();
 
   const [cache, setCache] = useState<ViewTranslationCache>({});
   const [isTranslating, setIsTranslating] = useState(false);
 
+  // Detect locale changes and clear cache when locale switches
+  useEffect(() => {
+    const newLocale = config.i18n.getCurrentLocale();
+    if (newLocale !== currentLocale) {
+      if (config.debug) {
+        console.log(`[Audar] Locale changed from ${currentLocale} to ${newLocale} - clearing cache`);
+      }
+      setCurrentLocale(newLocale);
+      setCache({}); // Clear stale translations
+      setIsTranslating(false);
+    }
+  });
+
   useEffect(() => {
     // Skip if default locale or no items
-    if (locale === defaultLocale || items.length === 0) {
+    if (currentLocale === defaultLocale || items.length === 0) {
       setCache({});
       setIsTranslating(false);
       return;
@@ -108,7 +123,7 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
       const contentHash = crypto.SHA256(contentString).toString().substring(0, 16);
 
       // 2. Check localStorage for cached metadata
-      const metadataKey = `translation_metadata_${viewName}_${locale}`;
+      const metadataKey = `translation_metadata_${viewName}_${currentLocale}`;
       const cachedMetadata = localStorage.getItem(metadataKey);
 
       if (cachedMetadata) {
@@ -119,7 +134,7 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
           if (metadata.contentHash === contentHash && metadata.itemCount === items.length) {
             if (config.debug) {
               console.log(
-                `[Audar] ✓ Using cached translations for ${viewName} (${locale}). ` +
+                `[Audar] ✓ Using cached translations for ${viewName} (${currentLocale}). ` +
                 `Last translated: ${new Date(metadata.lastTranslated).toLocaleString()}`
               );
             }
@@ -130,7 +145,7 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
           } else {
             if (config.debug) {
               console.log(
-                `[Audar] Content changed for ${viewName} (${locale}). ` +
+                `[Audar] Content changed for ${viewName} (${currentLocale}). ` +
                 `Old hash: ${metadata.contentHash.substring(0, 8)}..., New hash: ${contentHash.substring(0, 8)}...`
               );
             }
@@ -142,7 +157,7 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
         }
       } else {
         if (config.debug) {
-          console.log(`[Audar] First-time translation for ${viewName} (${locale})`);
+          console.log(`[Audar] First-time translation for ${viewName} (${currentLocale})`);
         }
       }
 
@@ -151,7 +166,7 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
 
       try {
         // Fetch cached translations from database
-        const cachedResults = await config.database.getCachedTranslations(items, locale);
+        const cachedResults = await config.database.getCachedTranslations(items, currentLocale);
 
         // Build cache map from database results
         const newCache: ViewTranslationCache = {};
@@ -183,14 +198,14 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
           const translatedTexts = await config.llm.translateBatch(
             uncachedItems,
             defaultLocale,
-            locale
+            currentLocale
           );
 
           // Save to database
           const translationsToSave = uncachedItems.map((item, idx) => ({
             content_type: item.contentType,
             content_id: item.contentId,
-            locale,
+            locale: currentLocale,
             original_text: item.text,
             translated_text: translatedTexts[idx],
             source_hash: crypto.SHA256(item.text).toString(),
@@ -205,7 +220,7 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
           });
 
           if (config.debug) {
-            console.log(`[Audar] ✓ Translated ${uncachedItems.length} new items for ${viewName} (${locale})`);
+            console.log(`[Audar] ✓ Translated ${uncachedItems.length} new items for ${viewName} (${currentLocale})`);
           }
         }
 
@@ -215,7 +230,7 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
         const metadata: ViewTranslationMetadata = {
           contentHash,
           lastTranslated: new Date().toISOString(),
-          locale,
+          locale: currentLocale,
           itemCount: items.length,
         };
         localStorage.setItem(metadataKey, JSON.stringify(metadata));
@@ -234,7 +249,7 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
       if (!config) return; // TypeScript guard (should never happen due to earlier check)
 
       try {
-        const cachedResults = await config.database.getCachedTranslations(items, locale);
+        const cachedResults = await config.database.getCachedTranslations(items, currentLocale);
 
         const newCache: ViewTranslationCache = {};
         cachedResults.forEach((r) => {
@@ -246,7 +261,7 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
 
         if (config.debug && Object.keys(newCache).length > 0) {
           console.log(
-            `[Audar] ⚡ Loaded ${Object.keys(newCache).length} cached translations for ${viewName} (${locale})`
+            `[Audar] ⚡ Loaded ${Object.keys(newCache).length} cached translations for ${viewName} (${currentLocale})`
           );
         }
       } catch (error) {
@@ -259,16 +274,16 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
     }
 
     translateView();
-  }, [viewName, locale, items.length]); // Re-run when items length changes
+  }, [viewName, currentLocale, items.length]); // Re-run when locale or items change
 
   const getTranslation = (contentType: string, contentId: string, fallback: string): string => {
-    if (locale === defaultLocale) return fallback;
+    if (currentLocale === defaultLocale) return fallback;
     const key = `${contentType}:${contentId}`;
     return cache[key] || fallback;
   };
 
   const isItemTranslating = (contentType: string, contentId: string): boolean => {
-    if (locale === defaultLocale) return false;
+    if (currentLocale === defaultLocale) return false;
     const key = `${contentType}:${contentId}`;
     return isTranslating && !cache[key];
   };

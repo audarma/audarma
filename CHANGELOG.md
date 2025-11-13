@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **CRITICAL**: Fixed locale caching bug in `ViewTranslationProvider` where switching languages would display cached translations from the previous language instead of translating to the new locale. The component now reactively detects locale changes and clears stale cache. (See DEMO_LEARNINGS.md #10)
+
 ## [0.1.0-alpha.0] - 2025-11-13
 
 ### Added
