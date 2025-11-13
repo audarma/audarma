@@ -1,6 +1,6 @@
 {
   "name": "audarma",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0-alpha.1",
   "description": "Progressive translation system for React/Next.js with smart caching and view-level translation tracking",
   "keywords": [
     "translation",
