@@ -1,14 +1,22 @@
 # Audarma
 
-> Progressive translation system for React/Next.js with smart caching and view-level translation tracking.
+> LLM-powered translation system for React/Next.js - translate dynamic content with smart caching.
 
 **ALPHA VERSION (0.1.0-alpha.0)** - This is an early extraction from a production app. APIs may change. Contributions welcome!
 
 ## What is Audarma?
 
-Audarma (from Kazakh "audar": translate) is a progressive translation system that translates dynamic content (products, messages, user-generated content) using LLMs, with intelligent caching to minimize costs.
+Audarma (from Kazakh "audar": translate) is an **LLM-powered translation system** for dynamic content. It uses Large Language Models (OpenAI, Claude, Gemini, etc.) to translate user-generated content, product descriptions, and messages - with intelligent caching to minimize API costs.
 
-Unlike traditional i18n libraries that translate static UI labels, Audarma focuses on **dynamic content translation** - the kind that changes frequently and can't be pre-translated.
+**Traditional i18n libraries** (next-intl, react-i18next) are designed for static UI labels that you translate once.
+
+**Audarma** is designed for **dynamic content** that changes frequently:
+- Product catalogs with thousands of items
+- User-generated messages and reviews
+- Real-time marketplace listings
+- Blog posts and articles
+
+With smart caching, you only pay for each translation once - subsequent requests are instant and free.
 
 ## Key Features
 

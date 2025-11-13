@@ -36,6 +36,10 @@ coverage/
 # AI assistant files (internal use only)
 .ai/
 
+# Internal planning docs (publish later)
+RELEASE.md
+DEMO_PLAN.md
+
 # Misc
 .cache/
 .temp/
