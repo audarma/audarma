@@ -13,12 +13,14 @@
 
 import crypto from 'crypto';
 import type {
-  AudarCLIConfig,
-  DiscoveredContent,
-  TranslationGap,
   DatabaseAdapter,
   LLMProvider,
   TranslationItem,
+} from '../src/types';
+import type {
+  AudarCLIConfig,
+  DiscoveredContent,
+  TranslationGap,
 } from '../src/types/content-sources';
 
 interface CLIOptions {
@@ -130,8 +132,9 @@ async function findTranslationGaps(
     for (const locale of targetLocales) {
       const key = `${item.contentType}:${item.contentId}`;
       const cached = cachedTranslations.find(
-        c => c.content_type === item.contentType &&
-             c.content_id === item.contentId
+        (c: { content_type: string; content_id: string; translated_text: string; source_hash: string }) =>
+          c.content_type === item.contentType &&
+          c.content_id === item.contentId
       );
 
       if (!cached || cached.source_hash !== item.sourceHash) {

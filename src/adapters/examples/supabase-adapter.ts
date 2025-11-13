@@ -16,12 +16,20 @@
 
 import type { DatabaseAdapter, TranslationItem } from '../../types';
 
+interface TranslationRow {
+  content_type: string;
+  content_id: string;
+  locale: string;
+  translated_text: string;
+  source_hash: string;
+}
+
 interface SupabaseClient {
   from(table: string): {
     select(columns: string): {
-      in(column: string, values: any[]): Promise<{ data: any[] | null; error: any }>;
+      in(column: string, values: unknown[]): Promise<{ data: TranslationRow[] | null; error: Error | null }>;
     };
-    upsert(data: any[], options?: { onConflict?: string }): Promise<{ data: any; error: any }>;
+    upsert(data: unknown[], options?: { onConflict?: string }): Promise<{ data: unknown; error: Error | null }>;
   };
 }
 
@@ -50,7 +58,7 @@ export function createSupabaseAdapter(supabase: SupabaseClient): DatabaseAdapter
       }
 
       // Filter by locale (Supabase doesn't support composite key queries easily)
-      return (data || []).filter((row: any) => row.locale === targetLocale);
+      return (data || []).filter((row) => row.locale === targetLocale);
     },
 
     async saveTranslations(translations) {

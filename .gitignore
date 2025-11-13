@@ -35,6 +35,7 @@ coverage/
 
 # AI assistant files (internal use only)
 .ai/
+.claude/
 
 # Internal planning docs (publish later)
 RELEASE.md

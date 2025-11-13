@@ -219,14 +219,22 @@ CREATE INDEX idx_locale ON content_translations(locale);
 
 See `/src/adapters/examples/` for reference implementations:
 
+**Database Adapters:**
 - **Supabase** - PostgreSQL database adapter
-- **Nebius** - LLM provider (OpenAI-compatible)
+
+**LLM Providers:**
+- **OpenAI** - GPT-5, GPT-4.1, o4-mini
+- **Anthropic** - Claude Sonnet 4.5, Claude Haiku 4.5, Claude Opus 4.1
+- **Cerebras** - Qwen3-235B, DeepSeek R1 with blazing speed and free daily credits
+- **Nebius** - OpenAI-compatible API
+
+**I18n Adapters:**
 - **next-intl** - I18n adapter for Next.js
 
 You can implement these interfaces for any backend:
 
 - **Databases**: Supabase, Prisma, Drizzle, raw SQL, MongoDB, Redis
-- **LLMs**: OpenAI, Anthropic, Google Gemini, local Llama models
+- **LLMs**: OpenAI, Anthropic (Claude), Google Gemini, Cerebras, Nebius, local Llama models
 - **I18n**: next-intl, react-i18next, FormatJS, custom
 
 ## Limitations & Known Issues
