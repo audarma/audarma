@@ -211,26 +211,45 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
             currentLocale
           );
 
-          // Save to database
-          const translationsToSave = uncachedItems.map((item, idx) => ({
-            content_type: item.contentType,
-            content_id: item.contentId,
-            locale: currentLocale,
-            original_text: item.text,
-            translated_text: translatedTexts[idx],
-            source_hash: canonicalItemHash(item.text),
-          }));
+          // Guard against a provider returning a wrong-length or sparse array:
+          // only cache and persist entries that came back as a non-empty
+          // string. Items without a valid translation are left out of the
+          // cache so they fall back to their source text rather than rendering
+          // (or persisting) a blank — and, since no row is saved for them, they
+          // are retried on the next mount.
+          const translationsToSave: Array<{
+            content_type: string;
+            content_id: string;
+            locale: string;
+            original_text: string;
+            translated_text: string;
+            source_hash: string;
+          }> = [];
 
-          await config.database.saveTranslations(translationsToSave);
-
-          // Add to cache
           uncachedItems.forEach((item, idx) => {
+            const translated = translatedTexts[idx];
+            if (typeof translated !== 'string' || translated.length === 0) return;
+
             const key = `${item.contentType}:${item.contentId}`;
-            newCache[key] = translatedTexts[idx];
+            newCache[key] = translated;
+            translationsToSave.push({
+              content_type: item.contentType,
+              content_id: item.contentId,
+              locale: currentLocale,
+              original_text: item.text,
+              translated_text: translated,
+              source_hash: canonicalItemHash(item.text),
+            });
           });
 
+          if (translationsToSave.length > 0) {
+            await config.database.saveTranslations(translationsToSave);
+          }
+
           if (config.debug) {
-            console.log(`[Audar] ✓ Translated ${uncachedItems.length} new items for ${viewName} (${currentLocale})`);
+            console.log(
+              `[Audar] ✓ Translated ${translationsToSave.length}/${uncachedItems.length} new items for ${viewName} (${currentLocale})`
+            );
           }
         }
 

@@ -36,20 +36,20 @@ interface SupabaseClient {
 export function createSupabaseAdapter(supabase: SupabaseClient): DatabaseAdapter {
   return {
     async getCachedTranslations(items: TranslationItem[], targetLocale: string) {
-      // Build list of (content_type, content_id) pairs to query
-      const pairs = items.map((item) => `(${item.contentType},${item.contentId})`);
-
-      if (pairs.length === 0) {
+      if (items.length === 0) {
         return [];
       }
 
-      // Query Supabase for cached translations
+      // Fetch candidate rows by content_id, then narrow to the exact
+      // (content_type, content_id) pairs and target locale in memory.
+      // NOTE: `locale` MUST be in the selected columns, otherwise the locale
+      // filter below compares against undefined and every lookup misses.
       const { data, error } = await supabase
         .from('content_translations')
-        .select('content_type, content_id, translated_text, source_hash')
+        .select('content_type, content_id, locale, translated_text, source_hash')
         .in(
-          '(content_type,content_id)',
-          items.map((item) => [item.contentType, item.contentId])
+          'content_id',
+          items.map((item) => item.contentId)
         );
 
       if (error) {
@@ -57,8 +57,12 @@ export function createSupabaseAdapter(supabase: SupabaseClient): DatabaseAdapter
         return [];
       }
 
-      // Filter by locale (Supabase doesn't support composite key queries easily)
-      return (data || []).filter((row) => row.locale === targetLocale);
+      const wanted = new Set(items.map((item) => `${item.contentType}:${item.contentId}`));
+      return (data || []).filter(
+        (row) =>
+          row.locale === targetLocale &&
+          wanted.has(`${row.content_type}:${row.content_id}`)
+      );
     },
 
     async saveTranslations(translations) {
