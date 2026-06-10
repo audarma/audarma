@@ -14,13 +14,51 @@
  * ```
  */
 
-import type { LLMProvider, TranslationItem } from '../../types';
+import type { LLMProvider, TranslateOptions, TranslationItem } from '../../types';
 
 interface OpenAIConfig {
   apiKey: string;
   model?: string;
   temperature?: number;
   baseURL?: string;
+}
+
+/**
+ * Build additional instruction lines from the optional per-call directives.
+ * Returns an empty string when no directives are provided, so the prompt is
+ * byte-for-byte identical to the original behavior.
+ */
+function buildDirectiveInstructions(options?: TranslateOptions): string {
+  if (!options) {
+    return '';
+  }
+
+  const lines: string[] = [];
+
+  if (options.glossary && Object.keys(options.glossary).length > 0) {
+    const pairs = Object.entries(options.glossary)
+      .map(([term, translation]) => `"${term}" -> "${translation}"`)
+      .join(', ');
+    lines.push(
+      `Use these exact translations for the following terms: ${pairs}.`
+    );
+  }
+
+  if (options.doNotTranslate && options.doNotTranslate.length > 0) {
+    lines.push(
+      `Keep the following terms verbatim (do NOT translate them): ${options.doNotTranslate.join(', ')}.`
+    );
+  }
+
+  if (options.formality) {
+    lines.push(`Use a ${options.formality} register/formality in the translation.`);
+  }
+
+  if (lines.length === 0) {
+    return '';
+  }
+
+  return `\n\n${lines.join('\n')}`;
 }
 
 interface OpenAIMessage {
@@ -48,12 +86,21 @@ export function createOpenAIProvider(config: OpenAIConfig): LLMProvider {
     async translateBatch(
       items: TranslationItem[],
       sourceLocale: string,
-      targetLocale: string
+      targetLocale: string,
+      options?: TranslateOptions
     ): Promise<string[]> {
+      // Keep the JSON-array output contract intact (the response parser
+      // depends on it); a caller-supplied systemPrompt EXTENDS the default
+      // instruction rather than replacing it.
+      const defaultSystemPrompt = `You are a professional translator. Translate the following texts from ${sourceLocale} to ${targetLocale}. Return ONLY a JSON array of translated strings, in the same order as the input. Do not include any explanations, markdown formatting, or code blocks.`;
+      const systemContent = options?.systemPrompt
+        ? `${options.systemPrompt}\n\n${defaultSystemPrompt}`
+        : defaultSystemPrompt;
+
       const messages: OpenAIMessage[] = [
         {
           role: 'system',
-          content: `You are a professional translator. Translate the following texts from ${sourceLocale} to ${targetLocale}. Return ONLY a JSON array of translated strings, in the same order as the input. Do not include any explanations, markdown formatting, or code blocks.`,
+          content: `${systemContent}${buildDirectiveInstructions(options)}`,
         },
         {
           role: 'user',
@@ -71,8 +118,12 @@ export function createOpenAIProvider(config: OpenAIConfig): LLMProvider {
           model,
           messages,
           temperature,
-          response_format: { type: 'json_object' },
+          // NOTE: we intentionally do NOT set response_format: { type:
+          // 'json_object' } here — that mode forces the response root to be a
+          // JSON *object*, but this adapter's prompt asks for (and the parser
+          // below expects) a JSON *array*. The prompt already constrains output.
         }),
+        ...(options?.signal ? { signal: options.signal } : {}),
       });
 
       if (!response.ok) {

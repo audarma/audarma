@@ -4,10 +4,14 @@ import { createContext, useContext, useState, useEffect, useMemo, useRef, ReactN
 import type {
   AudarConfig,
   TranslationItem,
+  TranslateOptions,
   ViewTranslationMetadata,
   UseViewTranslationResult,
 } from '../types';
 import { computeViewContentHash, canonicalItemHash, buildCacheFromDbResults } from './cache';
+import { withRetry } from './retry';
+import { runBatches } from './batching';
+import { createInvalidator } from './invalidation';
 
 interface ViewTranslationCache {
   [key: string]: string; // "contentType:contentId" -> translated text
@@ -130,8 +134,40 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
   const itemsRef = useRef(items);
   itemsRef.current = items;
 
+  // Keep config reachable inside the effect without making the effect re-run
+  // when an inline config object changes identity across renders. The effect
+  // itself is keyed off viewName/currentLocale/contentHash; the adapters and
+  // optional v0.2 settings (translation/retry/batching/onEvent) are read from
+  // this ref so behavior tracks the latest config without spurious re-fires.
+  const configRef = useRef(config);
+  configRef.current = config;
+
   useEffect(() => {
     const items = itemsRef.current;
+
+    // Emit an AudarEvent only when an onEvent callback is configured. With no
+    // callback this is a no-op (current behavior).
+    const emit = (event: Parameters<NonNullable<AudarConfig['onEvent']>>[0]) => {
+      configRef.current.onEvent?.(event);
+    };
+
+    // Build the per-call TranslateOptions from config.translation. The
+    // per-attempt AbortSignal (from withRetry, when a timeout is configured)
+    // is merged in at call time. With no config.translation and no timeout the
+    // resulting object carries no directives — providers that ignore the 4th
+    // argument are unaffected.
+    const buildTranslateOptions = (signal: AbortSignal | undefined): TranslateOptions => {
+      const directives = configRef.current.translation;
+      return {
+        ...(directives?.systemPrompt !== undefined ? { systemPrompt: directives.systemPrompt } : {}),
+        ...(directives?.glossary !== undefined ? { glossary: directives.glossary } : {}),
+        ...(directives?.doNotTranslate !== undefined
+          ? { doNotTranslate: directives.doNotTranslate }
+          : {}),
+        ...(directives?.formality !== undefined ? { formality: directives.formality } : {}),
+        ...(signal !== undefined ? { signal } : {}),
+      };
+    };
 
     // Skip if default locale or no items
     if (currentLocale === defaultLocale || items.length === 0) {
@@ -205,18 +241,35 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
 
         // Translate uncached items
         if (uncachedItems.length > 0) {
-          const translatedTexts = await config.llm.translateBatch(
-            uncachedItems,
-            defaultLocale,
-            currentLocale
-          );
+          // Observability (#7): some items missed the cache and need translation.
+          emit({
+            type: 'cache_miss',
+            viewName,
+            locale: currentLocale,
+            count: uncachedItems.length,
+          });
 
-          // Guard against a provider returning a wrong-length or sparse array:
-          // only cache and persist entries that came back as a non-empty
-          // string. Items without a valid translation are left out of the
-          // cache so they fall back to their source text rather than rendering
-          // (or persisting) a blank — and, since no row is saved for them, they
-          // are retried on the next mount.
+          // Determine how many batches runBatches will produce so the
+          // translate_start event reports an accurate batch count. With no
+          // config.batching (maxBatchSize undefined) this is a single batch —
+          // unchanged behavior.
+          const maxBatchSize = configRef.current.batching?.maxBatchSize;
+          const batchCount =
+            maxBatchSize !== undefined && Number.isFinite(maxBatchSize) && maxBatchSize > 0
+              ? Math.ceil(uncachedItems.length / Math.floor(maxBatchSize))
+              : 1;
+
+          emit({
+            type: 'translate_start',
+            viewName,
+            locale: currentLocale,
+            count: uncachedItems.length,
+            batches: batchCount,
+          });
+
+          // Accumulate persisted rows across all batches. Each batch persists
+          // (and progressively renders) only its own valid entries; this list
+          // is just for the debug summary line below.
           const translationsToSave: Array<{
             content_type: string;
             content_id: string;
@@ -226,25 +279,106 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
             source_hash: string;
           }> = [];
 
-          uncachedItems.forEach((item, idx) => {
-            const translated = translatedTexts[idx];
-            if (typeof translated !== 'string' || translated.length === 0) return;
+          // Tracks the 1-based attempt number for translate_error events. Reset
+          // per worker invocation; withRetry calls fn once per attempt.
+          const startedAt = Date.now();
 
-            const key = `${item.contentType}:${item.contentId}`;
-            newCache[key] = translated;
-            translationsToSave.push({
-              content_type: item.contentType,
-              content_id: item.contentId,
-              locale: currentLocale,
-              original_text: item.text,
-              translated_text: translated,
-              source_hash: canonicalItemHash(item.text),
+          // Worker translates ONE chunk. With no batching there is exactly one
+          // chunk = all uncached items, so this is the original single call.
+          // withRetry calls the inner fn once when no retry is configured,
+          // passing undefined as the per-attempt signal (unchanged behavior).
+          const worker = async (
+            batch: TranslationItem[]
+          ): Promise<string[]> => {
+            let attempt = 0;
+            return withRetry<string[]>(
+              (signal) => {
+                attempt += 1;
+                return configRef.current.llm
+                  .translateBatch(batch, defaultLocale, currentLocale, buildTranslateOptions(signal))
+                  .catch((error) => {
+                    // Emit a per-attempt error event (attempt is 1-based) and
+                    // re-throw so withRetry can retry / surface the failure.
+                    emit({
+                      type: 'translate_error',
+                      viewName,
+                      locale: currentLocale,
+                      attempt,
+                      error,
+                    });
+                    throw error;
+                  });
+              },
+              configRef.current.retry
+            );
+          };
+
+          // Progressive rendering (#11): merge each batch's valid results into
+          // the cache as soon as it resolves (via onBatchDone) so items appear
+          // batch-by-batch instead of after the whole pass. We keep the sparse/
+          // empty-string guard: only non-empty strings are cached and persisted.
+          const onBatchDone = (
+            batch: TranslationItem[],
+            results: string[]
+          ): void => {
+            const batchToSave: typeof translationsToSave = [];
+            const batchCacheUpdates: Record<string, string> = {};
+
+            batch.forEach((batchItem, idx) => {
+              const translated = results[idx];
+              if (typeof translated !== 'string' || translated.length === 0) return;
+
+              const key = `${batchItem.contentType}:${batchItem.contentId}`;
+              newCache[key] = translated;
+              batchCacheUpdates[key] = translated;
+              const row = {
+                content_type: batchItem.contentType,
+                content_id: batchItem.contentId,
+                locale: currentLocale,
+                original_text: batchItem.text,
+                translated_text: translated,
+                source_hash: canonicalItemHash(batchItem.text),
+              };
+              batchToSave.push(row);
+              translationsToSave.push(row);
             });
-          });
 
-          if (translationsToSave.length > 0) {
-            await config.database.saveTranslations(translationsToSave);
-          }
+            // Surface this batch's translations immediately. Merge into the
+            // existing cache state (rather than replacing) so already-rendered
+            // batches and DB-cache hits are preserved.
+            if (Object.keys(batchCacheUpdates).length > 0) {
+              setCache((prev) => ({ ...prev, ...batchCacheUpdates }));
+            }
+
+            // Persist this batch's rows. Fire-and-forget so a slow save does
+            // not block the next batch from rendering; errors are swallowed in
+            // debug-aware fashion to match the prior best-effort persistence.
+            if (batchToSave.length > 0) {
+              Promise.resolve(configRef.current.database.saveTranslations(batchToSave)).catch(
+                (error) => {
+                  if (configRef.current.debug) {
+                    console.error(`[Audar] Error saving translations for ${viewName}:`, error);
+                  }
+                }
+              );
+            }
+          };
+
+          await runBatches<TranslationItem, string>(
+            uncachedItems,
+            configRef.current.batching,
+            worker,
+            onBatchDone
+          );
+
+          // Observability (#7): the whole translate pass completed successfully.
+          emit({
+            type: 'translate_success',
+            viewName,
+            locale: currentLocale,
+            count: translationsToSave.length,
+            latencyMs: Date.now() - startedAt,
+          });
 
           if (config.debug) {
             console.log(
@@ -253,6 +387,13 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
           }
         }
 
+        // Commit the full cache (DB hits + every batch's results) by REPLACING
+        // the state, exactly as the original did. The progressive setCache
+        // calls above already rendered items as their batches resolved; every
+        // key they added is also present in newCache, so this authoritative
+        // replace both reconciles to the complete map AND drops any stale keys
+        // from a previous render — preserving the original byte-for-byte
+        // commit semantics.
         setCache(newCache);
 
         // Save metadata to localStorage
@@ -301,6 +442,15 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
         }
 
         setCache(newCache);
+
+        // Observability (#7): the view was served entirely from cache (all
+        // items had a valid, source_hash-matching DB row). count = items served.
+        emit({
+          type: 'cache_hit',
+          viewName,
+          locale: currentLocale,
+          count: Object.keys(newCache).length,
+        });
 
         if (config.debug && Object.keys(newCache).length > 0) {
           console.log(
@@ -383,4 +533,36 @@ export function useViewTranslation(
 export function useViewTranslationStatus() {
   const { isTranslating } = useContext(ViewTranslationContext);
   return { isTranslating };
+}
+
+/**
+ * useAudarInvalidator - Programmatic cache invalidation bound to the
+ * AudarProvider config.
+ *
+ * Reads the {@link AudarConfig} from the surrounding AudarProvider and returns
+ * a {@link createInvalidator} instance. Use it to evict stale DB translations
+ * (`invalidate` / `invalidateLocale`) or clear a view's localStorage
+ * fingerprint (`invalidateView`) after the underlying source content changes.
+ *
+ * Must be used within AudarProvider — throws the same error as the other
+ * provider hooks if no config is in context.
+ *
+ * @example
+ * ```tsx
+ * const invalidator = useAudarInvalidator();
+ * await invalidator.invalidate('product_title', product.id); // all locales
+ * invalidator.invalidateView('feed', 'ru');                  // localStorage only
+ * ```
+ */
+export function useAudarInvalidator(): ReturnType<typeof createInvalidator> {
+  const config = useContext(AudarConfigContext);
+
+  if (!config) {
+    throw new Error('ViewTranslationProvider must be used within AudarProvider');
+  }
+
+  // Memoize so the returned invalidator is stable across renders for a given
+  // config object (the factory itself is cheap, but a stable identity avoids
+  // surprising consumers that put it in effect deps).
+  return useMemo(() => createInvalidator(config), [config]);
 }

@@ -16,13 +16,56 @@
  * ```
  */
 
-import type { LLMProvider, TranslationItem } from '../../types';
+import type { LLMProvider, TranslateOptions, TranslationItem } from '../../types';
 
 interface NebiusConfig {
   apiKey: string;
   model?: string;
   baseUrl?: string;
   temperature?: number;
+}
+
+interface NebiusMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+/**
+ * Build additional rule lines from the optional per-call directives. Returns
+ * an empty string when no directives are provided, so the prompt is
+ * byte-for-byte identical to the original behavior.
+ */
+function buildDirectiveRules(options?: TranslateOptions): string {
+  if (!options) {
+    return '';
+  }
+
+  const lines: string[] = [];
+
+  if (options.glossary && Object.keys(options.glossary).length > 0) {
+    const pairs = Object.entries(options.glossary)
+      .map(([term, translation]) => `"${term}" -> "${translation}"`)
+      .join(', ');
+    lines.push(
+      `- Use these exact translations for the following terms: ${pairs}`
+    );
+  }
+
+  if (options.doNotTranslate && options.doNotTranslate.length > 0) {
+    lines.push(
+      `- Keep the following terms verbatim (do NOT translate them): ${options.doNotTranslate.join(', ')}`
+    );
+  }
+
+  if (options.formality) {
+    lines.push(`- Use a ${options.formality} register/formality in the translation`);
+  }
+
+  if (lines.length === 0) {
+    return '';
+  }
+
+  return `\n${lines.join('\n')}`;
 }
 
 export function createNebiusProvider(config: NebiusConfig): LLMProvider {
@@ -34,7 +77,12 @@ export function createNebiusProvider(config: NebiusConfig): LLMProvider {
   } = config;
 
   return {
-    async translateBatch(items: TranslationItem[], sourceLocale: string, targetLocale: string) {
+    async translateBatch(
+      items: TranslationItem[],
+      sourceLocale: string,
+      targetLocale: string,
+      options?: TranslateOptions
+    ) {
       // Build prompt with all items
       const itemsList = items
         .map((item, idx) => `${idx + 1}. [${item.contentType}] ${item.text}`)
@@ -47,12 +95,21 @@ Rules:
 - Keep the numbering (1., 2., 3., etc.)
 - Do NOT include [content_type] tags in output
 - Preserve formatting and line breaks
-- Keep technical terms and brand names unchanged when appropriate
+- Keep technical terms and brand names unchanged when appropriate${buildDirectiveRules(options)}
 
 Content to translate:
 ${itemsList}
 
 Translations:`;
+
+      // A caller-supplied systemPrompt is prepended as a system message; when
+      // not provided, only the original single user message is sent.
+      const messages: NebiusMessage[] = options?.systemPrompt
+        ? [
+            { role: 'system', content: options.systemPrompt },
+            { role: 'user', content: prompt },
+          ]
+        : [{ role: 'user', content: prompt }];
 
       // Call Nebius API (OpenAI-compatible)
       const response = await fetch(`${baseUrl}chat/completions`, {
@@ -63,15 +120,11 @@ Translations:`;
         },
         body: JSON.stringify({
           model,
-          messages: [
-            {
-              role: 'user',
-              content: prompt,
-            },
-          ],
+          messages,
           temperature,
           max_tokens: 4000,
         }),
+        ...(options?.signal ? { signal: options.signal } : {}),
       });
 
       if (!response.ok) {
