@@ -97,7 +97,7 @@ Return ONLY a JSON array of translated strings, in the same order as the input. 
         }
         return translations;
       } catch (err) {
-        throw new Error(`Failed to parse Anthropic response: ${err}`);
+        throw new Error(`Failed to parse Anthropic response: ${err}`, { cause: err });
       }
     },
   };

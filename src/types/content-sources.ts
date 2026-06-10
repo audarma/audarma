@@ -119,7 +119,6 @@ export interface TranslationProgress {
   itemsCompleted: number;
   batchNumber: number;
   totalBatches: number;
-  estimatedCost: number;
 }
 
 /**
@@ -129,11 +128,9 @@ export interface TranslationResult {
   totalItems: number;
   translatedItems: number;
   cachedItems: number;
-  totalCost: number;
   duration: number;
   locales: string[];
   summary: Record<string, {
     items: number;
-    cost: number;
   }>;
 }

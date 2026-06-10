@@ -2,14 +2,14 @@
  * Example next-intl I18n Adapter
  *
  * This is a reference implementation showing how to integrate next-intl
- * with Audar's translation system.
+ * with Audarma's translation system.
  *
  * Note: This adapter is for CLIENT components only. For server components,
  * you'll need to pass locale explicitly or use a different approach.
  *
  * @example
  * ```ts
- * import { createNextIntlAdapter } from 'audar/adapters/examples/next-intl-adapter';
+ * import { createNextIntlAdapter } from 'audarma/adapters/examples/next-intl-adapter';
  *
  * const adapter = createNextIntlAdapter({
  *   supportedLocales: ['en', 'es', 'fr', 'de', 'ru', 'kk', 'ja'],
@@ -65,7 +65,7 @@ export function createNextIntlAdapter(config: NextIntlConfig): I18nAdapter {
  * ```tsx
  * // In your app code (client component):
  * import { useLocale } from 'next-intl';
- * import { createClientNextIntlAdapter } from 'audar/adapters/examples/next-intl-adapter';
+ * import { createClientNextIntlAdapter } from 'audarma/adapters/examples/next-intl-adapter';
  *
  * function MyApp() {
  *   const locale = useLocale();

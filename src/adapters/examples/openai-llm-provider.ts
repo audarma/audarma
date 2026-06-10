@@ -94,7 +94,7 @@ export function createOpenAIProvider(config: OpenAIConfig): LLMProvider {
         }
         return translations;
       } catch (err) {
-        throw new Error(`Failed to parse OpenAI response: ${err}`);
+        throw new Error(`Failed to parse OpenAI response: ${err}`, { cause: err });
       }
     },
   };

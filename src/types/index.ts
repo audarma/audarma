@@ -32,7 +32,6 @@ export interface TranslationResponse {
     totalItems: number;
     cachedItems: number;
     translatedItems: number;
-    estimatedCost?: number;
     timestamp: string;
   };
 }

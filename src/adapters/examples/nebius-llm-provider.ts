@@ -2,11 +2,11 @@
  * Example Nebius LLM Provider
  *
  * This is a reference implementation showing how to integrate Nebius Studio
- * (OpenAI-compatible API) with Audar's translation system.
+ * (OpenAI-compatible API) with Audarma's translation system.
  *
  * @example
  * ```ts
- * import { createNebiusProvider } from 'audar/adapters/examples/nebius-llm-provider';
+ * import { createNebiusProvider } from 'audarma/adapters/examples/nebius-llm-provider';
  *
  * const provider = createNebiusProvider({
  *   apiKey: process.env.NEBIUS_API_KEY,
@@ -92,7 +92,7 @@ Translations:`;
 
       for (const line of lines) {
         // Match "1. Text here" or "1) Text here"
-        const match = line.match(/^\d+[\.\)]\s*(.+)$/);
+        const match = line.match(/^\d+[.)]\s*(.+)$/);
         if (match) {
           translations.push(match[1].trim());
         }

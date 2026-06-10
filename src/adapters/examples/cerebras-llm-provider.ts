@@ -97,7 +97,7 @@ export function createCerebrasProvider(config: CerebrasConfig): LLMProvider {
         }
         return translations;
       } catch (err) {
-        throw new Error(`Failed to parse Cerebras response: ${err}`);
+        throw new Error(`Failed to parse Cerebras response: ${err}`, { cause: err });
       }
     },
   };
