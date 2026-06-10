@@ -2,12 +2,12 @@
  * Example Supabase Database Adapter
  *
  * This is a reference implementation showing how to integrate Supabase
- * with Audar's translation caching system.
+ * with Audarma's translation caching system.
  *
  * @example
  * ```ts
  * import { createClient } from '@supabase/supabase-js';
- * import { createSupabaseAdapter } from 'audar/adapters/examples/supabase-adapter';
+ * import { createSupabaseAdapter } from 'audarma/adapters/examples/supabase-adapter';
  *
  * const supabase = createClient(url, key);
  * const adapter = createSupabaseAdapter(supabase);

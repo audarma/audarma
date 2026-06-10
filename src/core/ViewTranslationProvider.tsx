@@ -1,13 +1,13 @@
 'use client';
 
-import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
-import crypto from 'crypto-js';
+import { createContext, useContext, useState, useEffect, useMemo, useRef, ReactNode } from 'react';
 import type {
   AudarConfig,
   TranslationItem,
   ViewTranslationMetadata,
   UseViewTranslationResult,
 } from '../types';
+import { computeViewContentHash, canonicalItemHash, buildCacheFromDbResults } from './cache';
 
 interface ViewTranslationCache {
   [key: string]: string; // "contentType:contentId" -> translated text
@@ -93,7 +93,12 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
   const [cache, setCache] = useState<ViewTranslationCache>({});
   const [isTranslating, setIsTranslating] = useState(false);
 
-  // Detect locale changes and clear cache when locale switches
+  // Detect locale changes and clear cache when locale switches.
+  // NOTE: this effect intentionally has NO dependency array — the I18nAdapter
+  // interface has no subscribe method, so polling getCurrentLocale() on every
+  // render is the only way to detect external locale switches. The early-out
+  // comparison below makes the no-op path cheap (a string compare + nothing
+  // else), so leaving it dependency-less is safe and avoids regressions.
   useEffect(() => {
     const newLocale = config.i18n.getCurrentLocale();
     if (newLocale !== currentLocale) {
@@ -106,7 +111,28 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
     }
   });
 
+  // Stable, order-independent hash of the view's content. This drives the
+  // translation effect so that ANY change to item text (not just item count)
+  // re-fires the effect and re-translates changed items.
+  //
+  // The memo deps on a serialized fingerprint of the items' content rather
+  // than the array reference, so it stays correct even if a parent passes the
+  // same array reference across renders while mutating item text in place.
+  const contentFingerprint = items
+    .map((item) => `${item.contentType}:${item.contentId}:${item.text}`)
+    .join('|');
+  const contentHash = useMemo(() => computeViewContentHash(items), [contentFingerprint]);
+
+  // Keep the latest items available inside the translation effect without
+  // making the effect re-run on unrelated re-renders. The effect depends on
+  // contentHash (which already captures every text/id change), so reading
+  // items from this ref is equivalent to closing over the current snapshot.
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+
   useEffect(() => {
+    const items = itemsRef.current;
+
     // Skip if default locale or no items
     if (currentLocale === defaultLocale || items.length === 0) {
       setCache({});
@@ -114,17 +140,14 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
       return;
     }
 
-    const translateView = async () => {
-      // 1. Calculate content hash (hash of all content IDs + texts)
-      const contentString = items
-        .map((item) => `${item.contentType}:${item.contentId}:${item.text}`)
-        .sort()
-        .join('|');
-      const contentHash = crypto.SHA256(contentString).toString().substring(0, 16);
-
-      // 2. Check localStorage for cached metadata
+    const translateView = async (forceTranslate = false) => {
+      // 1. Check localStorage for cached metadata. When forceTranslate is set
+      // (the stale-row recovery path calls back in), we skip this check and go
+      // straight to the translate pass below — otherwise the metadata would
+      // still match and route us back into loadFromDatabaseCache, recursing
+      // forever until the DB happens to return fresh rows.
       const metadataKey = `translation_metadata_${viewName}_${currentLocale}`;
-      const cachedMetadata = localStorage.getItem(metadataKey);
+      const cachedMetadata = forceTranslate ? null : localStorage.getItem(metadataKey);
 
       if (cachedMetadata) {
         try {
@@ -161,31 +184,18 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
         }
       }
 
-      // 3. Need to translate - fetch from database first, then translate missing
+      // 2. Need to translate - fetch from database first, then translate missing
       setIsTranslating(true);
 
       try {
         // Fetch cached translations from database
         const cachedResults = await config.database.getCachedTranslations(items, currentLocale);
 
-        // Build cache map from database results
-        const newCache: ViewTranslationCache = {};
-        const cachedMap = new Map(
-          cachedResults.map((r) => [`${r.content_type}:${r.content_id}`, r.translated_text])
-        );
-
-        // Identify items that need translation
-        const uncachedItems: TranslationItem[] = [];
-        items.forEach((item) => {
-          const key = `${item.contentType}:${item.contentId}`;
-          const cached = cachedMap.get(key);
-
-          if (cached) {
-            newCache[key] = cached;
-          } else {
-            uncachedItems.push(item);
-          }
-        });
+        // Build cache map from database results. A DB row is only a valid hit
+        // when its source_hash matches the current canonical hash of the
+        // item's text — rows translated from stale source text are treated as
+        // a miss and re-translated below.
+        const { cache: newCache, uncachedItems } = buildCacheFromDbResults(items, cachedResults);
 
         if (config.debug) {
           console.log(
@@ -208,7 +218,7 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
             locale: currentLocale,
             original_text: item.text,
             translated_text: translatedTexts[idx],
-            source_hash: crypto.SHA256(item.text).toString(),
+            source_hash: canonicalItemHash(item.text),
           }));
 
           await config.database.saveTranslations(translationsToSave);
@@ -251,11 +261,25 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
       try {
         const cachedResults = await config.database.getCachedTranslations(items, currentLocale);
 
-        const newCache: ViewTranslationCache = {};
-        cachedResults.forEach((r) => {
-          const key = `${r.content_type}:${r.content_id}`;
-          newCache[key] = r.translated_text;
-        });
+        // Only rows whose source_hash matches the current item text are valid
+        // hits. Stale/missing rows surface as uncachedItems below.
+        const { cache: newCache, uncachedItems } = buildCacheFromDbResults(items, cachedResults);
+
+        // If any items are stale (source_hash mismatch) or missing from the
+        // DB, run a full translate pass instead of committing the partial
+        // cache — committing it here would flash partially-translated content
+        // before the translate pass overwrites it. translateView(true) skips
+        // the metadata check (which still matches) and re-fetches, merges valid
+        // hits, translates the rest, and re-saves.
+        if (uncachedItems.length > 0) {
+          if (config.debug) {
+            console.log(
+              `[Audar] ${uncachedItems.length} item(s) stale or missing in cache for ${viewName} (${currentLocale}) - re-translating`
+            );
+          }
+          translateView(true);
+          return;
+        }
 
         setCache(newCache);
 
@@ -269,12 +293,16 @@ export function ViewTranslationProvider({ viewName, items, children }: ViewTrans
           console.error(`[Audar] Error loading cache for ${viewName}:`, error);
         }
         // Fallback: translate fresh
-        translateView();
+        translateView(true);
       }
     }
 
     translateView();
-  }, [viewName, currentLocale, items.length]); // Re-run when locale or items change
+    // Depend on the memoized content hash (not items.length) so the effect
+    // re-fires whenever ANY item's text or id changes — even when the item
+    // count is unchanged. items themselves are read from itemsRef inside the
+    // effect to avoid re-running on unrelated re-renders.
+  }, [viewName, currentLocale, contentHash]);
 
   const getTranslation = (contentType: string, contentId: string, fallback: string): string => {
     if (currentLocale === defaultLocale) return fallback;

@@ -40,7 +40,7 @@ Audarma supports two complementary modes that share the same cache:
 ### CLI Mode (Batch)
 - Pre-translates content before deployment
 - Best for: SEO, high-traffic pages, new locale launches
-- Setup: Create `audarma.config.ts` and run `npm run translate`
+- Setup: Create an `audarma.config.ts` that exports `{ config, database, llm }`, then run `npx audarma translate` (supports `--locale=<code>`, `--dry-run`, and `--config=<path>`)
 
 **Use both together** for optimal performance: CLI pre-fills cache, lazy mode catches gaps.
 
@@ -244,7 +244,7 @@ This is an **alpha release** extracted from a production app. Here are known lim
 ### Current Limitations
 
 1. **Hard-coded English source** - Currently assumes English as source language
-2. **No cache invalidation API** - Must manually delete translations when source text changes
+2. **No manual cache-invalidation API** - Source-text changes are now detected automatically (each translation stores a hash of its source text and is re-translated when that changes), but there's no API yet to force-purge or bulk-invalidate translations on demand
 3. **No error boundaries** - Translation errors can crash views
 4. **No retry logic** - Failed translations aren't automatically retried
 5. **No cost tracking** - No built-in token counting or cost estimation
@@ -291,6 +291,17 @@ Help us prioritize! Open an issue to vote or propose features.
 - [ ] Real-time collaborative translation
 - [ ] Translation memory (suggest similar translations)
 
+## Development
+
+```bash
+npm install        # install dependencies
+npm run build      # build the library + CLI into dist/ (tsup)
+npm run type-check # type-check with tsc (no emit)
+npm run lint       # lint src/ and cli/ (ESLint flat config)
+npm test           # run the test suite (Vitest + jsdom)
+npm run test:watch # run tests in watch mode
+```
+
 ## Contributing
 
 This is an **early alpha release** - we need your help!
@@ -331,7 +342,7 @@ Yes! Audarma is designed to complement existing i18n libraries. Use next-intl/re
 
 ### How do I handle content updates?
 
-Currently, you must manually delete old translations from database. Cache invalidation API is on the roadmap.
+Content updates are handled automatically. Each cached translation stores a SHA-256 hash of its source text; when the source text changes, the hash no longer matches and the item is re-translated on its next view (lazy mode) or its next CLI run. You only need to delete translations manually if you want to force a re-translation *without* a source change (a bulk-invalidation API is on the roadmap).
 
 ## Support
 

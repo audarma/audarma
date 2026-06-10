@@ -1,11 +1,11 @@
 /**
- * Audar - Progressive Translation System
+ * Audarma - Progressive Translation System
  *
  * A React/Next.js translation system with smart caching and view-level translation tracking.
  *
  * @example
  * ```tsx
- * import { AudarProvider, ViewTranslationProvider, useViewTranslation } from 'audar';
+ * import { AudarProvider, ViewTranslationProvider, useViewTranslation } from 'audarma';
  *
  * // Configure at app root
  * <AudarProvider config={{
@@ -33,6 +33,13 @@ export {
   useViewTranslation,
   useViewTranslationStatus,
 } from './core/ViewTranslationProvider';
+
+// Pure cache helpers (exported for testing and advanced consumers)
+export {
+  computeViewContentHash,
+  canonicalItemHash,
+  buildCacheFromDbResults,
+} from './core/cache';
 
 // Type definitions
 export type {

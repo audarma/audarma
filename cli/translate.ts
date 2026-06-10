@@ -6,9 +6,9 @@
  * and filling translation gaps.
  *
  * Usage:
- *   npx audar translate
- *   npx audar translate --locale ja
- *   npx audar translate --dry-run
+ *   npx audarma translate
+ *   npx audarma translate --locale ja
+ *   npx audarma translate --dry-run
  */
 
 import crypto from 'crypto';
@@ -60,12 +60,13 @@ async function discoverContent(
       continue;
     }
 
-    // Calculate source hash
+    // Calculate canonical source hash (full 64-char hex, NO truncation).
+    // Must match the provider's crypto.SHA256(text).toString() exactly so
+    // that CLI-mode and lazy-mode produce identical hashes for the same text.
     const sourceHash = crypto
       .createHash('sha256')
       .update(item.text)
-      .digest('hex')
-      .substring(0, 16);
+      .digest('hex');
 
     allContent.push({
       contentType: item.contentType,
@@ -91,53 +92,57 @@ async function discoverContent(
 }
 
 /**
- * Find translation gaps (content missing translations for locales)
+ * A single cached translation row, as returned by
+ * DatabaseAdapter.getCachedTranslations (only the fields needed for gap
+ * detection).
  */
-async function findTranslationGaps(
+type CachedRow = {
+  content_type: string;
+  content_id: string;
+  source_hash: string;
+};
+
+/**
+ * Pure gap-computation logic (no IO — fully testable).
+ *
+ * For each content item, determine — per target locale — whether a *valid*
+ * cached translation already exists. A cached row counts as present only if
+ * its source_hash equals the item's canonical sourceHash (staleness check):
+ * if the source text changed, the old cached row no longer matches and the
+ * locale is treated as missing.
+ *
+ * @param content - Discovered content items (each carries its canonical sourceHash)
+ * @param cachedByLocale - Map of locale -> cached rows for that locale
+ * @param targetLocales - Locales to check for gaps
+ * @returns One TranslationGap per item that is missing at least one locale
+ */
+export function computeGaps(
   content: DiscoveredContent[],
-  locales: string[],
-  database: DatabaseAdapter,
-  targetLocale?: string
-): Promise<TranslationGap[]> {
-  console.log('\n🔍 Finding translation gaps...');
-
-  const gaps: TranslationGap[] = [];
-  const targetLocales = targetLocale ? [targetLocale] : locales;
-
-  // Get existing translations from cache
-  const cachedTranslations = await database.getCachedTranslations(
-    content.map(c => ({
-      contentType: c.contentType,
-      contentId: c.contentId,
-      text: c.text,
-    })),
-    targetLocales[0] // Just check first locale for now (optimize later)
-  );
-
-  // Build cache map for quick lookup
-  const cacheMap = new Map<string, Set<string>>();
-  for (const cached of cachedTranslations) {
-    const key = `${cached.content_type}:${cached.content_id}`;
-    if (!cacheMap.has(key)) {
-      cacheMap.set(key, new Set());
+  cachedByLocale: Record<string, CachedRow[]>,
+  targetLocales: string[]
+): TranslationGap[] {
+  // Build a per-locale lookup of `${content_type}:${content_id}` -> source_hash
+  // so each item/locale check is O(1) instead of scanning the cache array.
+  const indexByLocale: Record<string, Map<string, string>> = {};
+  for (const locale of targetLocales) {
+    const index = new Map<string, string>();
+    for (const row of cachedByLocale[locale] ?? []) {
+      index.set(`${row.content_type}:${row.content_id}`, row.source_hash);
     }
-    // We'd need to query each locale separately in real implementation
-    // For now, assume we need to check all locales
+    indexByLocale[locale] = index;
   }
 
-  // Find gaps for each content item
+  const gaps: TranslationGap[] = [];
+
   for (const item of content) {
+    const key = `${item.contentType}:${item.contentId}`;
     const missingLocales: string[] = [];
 
     for (const locale of targetLocales) {
-      const key = `${item.contentType}:${item.contentId}`;
-      const cached = cachedTranslations.find(
-        (c: { content_type: string; content_id: string; translated_text: string; source_hash: string }) =>
-          c.content_type === item.contentType &&
-          c.content_id === item.contentId
-      );
-
-      if (!cached || cached.source_hash !== item.sourceHash) {
+      const cachedHash = indexByLocale[locale].get(key);
+      // Missing if there is no cached row for this locale, or the cached row
+      // is stale (its source_hash no longer matches the current source text).
+      if (cachedHash === undefined || cachedHash !== item.sourceHash) {
         missingLocales.push(locale);
       }
     }
@@ -149,6 +154,41 @@ async function findTranslationGaps(
       });
     }
   }
+
+  return gaps;
+}
+
+/**
+ * Find translation gaps (content missing translations for locales).
+ *
+ * Handles the IO (querying the cache once *per* target locale) and delegates
+ * the gap math to the pure computeGaps() helper.
+ */
+async function findTranslationGaps(
+  content: DiscoveredContent[],
+  locales: string[],
+  database: DatabaseAdapter,
+  targetLocale?: string
+): Promise<TranslationGap[]> {
+  console.log('\n🔍 Finding translation gaps...');
+
+  const targetLocales = targetLocale ? [targetLocale] : locales;
+
+  const items = content.map(c => ({
+    contentType: c.contentType,
+    contentId: c.contentId,
+    text: c.text,
+  }));
+
+  // Query the cache once per target locale (the previous implementation only
+  // queried the first locale and incorrectly applied that result to all
+  // locales).
+  const cachedByLocale: Record<string, CachedRow[]> = {};
+  for (const locale of targetLocales) {
+    cachedByLocale[locale] = await database.getCachedTranslations(items, locale);
+  }
+
+  const gaps = computeGaps(content, cachedByLocale, targetLocales);
 
   console.log(`Found ${gaps.length} items needing translation`);
 
@@ -311,29 +351,83 @@ export async function runTranslation(
 }
 
 /**
+ * Shape a user config module must provide (default- or named-exported).
+ */
+interface LoadedConfigModule {
+  config: AudarCLIConfig;
+  database: DatabaseAdapter;
+  llm: LLMProvider;
+}
+
+/**
+ * Load the user config module (TS or JS) at runtime using jiti, so users can
+ * author `audarma.config.ts` with full TypeScript and imports.
+ */
+function loadConfigModule(resolvedConfigPath: string): LoadedConfigModule {
+  // jiti compiles TS/ESM on the fly so the CJS CLI bundle can require a
+  // TypeScript config file.
+  const { createJiti } = require('jiti');
+  const jiti = createJiti(__filename);
+  const mod = jiti(resolvedConfigPath);
+  const loaded = (mod && mod.default) ?? mod;
+
+  if (!loaded || typeof loaded !== 'object') {
+    throw new Error(
+      `Config at ${resolvedConfigPath} did not export an object. ` +
+      'Expected a default (or named) export of { config, database, llm }.'
+    );
+  }
+
+  const missing: string[] = [];
+  if (!loaded.config) missing.push('config');
+  if (!loaded.database) missing.push('database');
+  if (!loaded.llm) missing.push('llm');
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Config at ${resolvedConfigPath} is missing required export(s): ${missing.join(', ')}.\n` +
+      'Your config must export { config: AudarCLIConfig, database: DatabaseAdapter, llm: LLMProvider }.'
+    );
+  }
+
+  return loaded as LoadedConfigModule;
+}
+
+/**
  * CLI entry point
  */
 export async function main() {
+  const path = require('path') as typeof import('path');
+
   // Parse command line arguments
   const args = process.argv.slice(2);
   const options: CLIOptions = {
     dryRun: args.includes('--dry-run'),
+    force: args.includes('--force'),
     locale: args.find(a => a.startsWith('--locale='))?.split('=')[1],
-    config: args.find(a => a.startsWith('--config='))?.split('=')[1] || './audar.config.ts',
+    config: args.find(a => a.startsWith('--config='))?.split('=')[1] || './audarma.config.ts',
   };
 
   try {
     // Load config file
-    const configPath = options.config || './audar.config.ts';
-    console.log(`📋 Loading config from ${configPath}...`);
+    const configPath = options.config || './audarma.config.ts';
+    const resolvedConfigPath = path.resolve(process.cwd(), configPath);
+    console.log(`📋 Loading config from ${resolvedConfigPath}...`);
 
-    // In a real implementation, we'd dynamically import the config
-    // For now, throw an error with instructions
-    throw new Error(
-      'CLI not yet wired up to config file.\n' +
-      'Please use runTranslation() function directly from your code.\n' +
-      'See packages/audar/docs/dual-mode-translation.md for examples.'
-    );
+    let loaded: LoadedConfigModule;
+    try {
+      loaded = loadConfigModule(resolvedConfigPath);
+    } catch (loadError) {
+      throw new Error(
+        `Failed to load config from ${resolvedConfigPath}.\n` +
+        `${loadError instanceof Error ? loadError.message : loadError}\n` +
+        'Create an audarma.config.ts that exports { config, database, llm }.\n' +
+        'See audarma/docs/dual-mode-translation.md for examples.',
+        { cause: loadError }
+      );
+    }
+
+    await runTranslation(loaded.config, loaded.database, loaded.llm, options);
   } catch (error) {
     console.error('❌ Error:', error instanceof Error ? error.message : error);
     process.exit(1);
