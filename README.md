@@ -83,6 +83,9 @@ export function useAudarmaConfig(): AudarConfig {
       getDefaultLocale: () => 'en',
       getSupportedLocales: () => ['en', 'es', 'fr', 'de', 'ru', 'ja']
     },
+    // `defaultLocale` is your content's SOURCE language (content is translated
+    // FROM it, and views in this locale render as-is). It can be any locale —
+    // it is not restricted to English.
     defaultLocale: 'en',
     debug: true
   };
@@ -243,14 +246,13 @@ This is an **alpha release** extracted from a production app. Here are known lim
 
 ### Current Limitations
 
-1. **Hard-coded English source** - Currently assumes English as source language
-2. **No manual cache-invalidation API** - Source-text changes are now detected automatically (each translation stores a hash of its source text and is re-translated when that changes), but there's no API yet to force-purge or bulk-invalidate translations on demand
-3. **No error boundaries** - Translation errors can crash views
-4. **No retry logic** - Failed translations aren't automatically retried
-5. **No cost tracking** - No built-in token counting or cost estimation
-6. **Client-side only** - Server component support needs work
-7. **No streaming** - All translations must complete before returning
-8. **No partial updates** - Can't update cache incrementally
+1. **No manual cache-invalidation API** - Source-text changes are now detected automatically (each translation stores a hash of its source text and is re-translated when that changes), but there's no API yet to force-purge or bulk-invalidate translations on demand
+2. **No error boundaries** - There is no built-in React error boundary (a failed translation falls back to the source text rather than crashing, but render-time errors are not caught)
+3. **No retry logic** - Failed translations aren't automatically retried
+4. **No cost tracking** - No built-in token counting or cost estimation
+5. **Client-side only** - Server component support needs work
+6. **No streaming** - All translations must complete before returning
+7. **No partial updates** - Can't update cache incrementally
 
 ### Documented Bugs (Fixed in Production)
 

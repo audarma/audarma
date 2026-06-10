@@ -406,3 +406,37 @@ describe('Locale switch clears stale translations', () => {
     await waitFor(() => expect(llm.translateBatch).toHaveBeenCalledTimes(2));
   });
 });
+
+// ---------------------------------------------------------------------------
+// 11. Robustness: provider returns fewer translations than requested
+// ---------------------------------------------------------------------------
+
+describe('Robustness (provider returns a short/sparse batch)', () => {
+  it('persists/caches only valid entries; missing ones fall back to source', async () => {
+    const { config, llm, database } = makeConfig({
+      currentLocale: 'ru',
+      defaultLocale: 'en',
+      cachedRows: [],
+      // Two items requested, but the provider only returns one translation.
+      translate: () => ['RU:First'],
+    });
+    const items = [item('title', '1', 'First'), item('title', '2', 'Second')];
+
+    render(
+      <Harness config={config} items={items}>
+        <Consumer contentType="title" contentId="1" text="First" testId="a" />
+        <Consumer contentType="title" contentId="2" text="Second" testId="b" />
+      </Harness>
+    );
+
+    await waitFor(() => expect(screen.getByTestId('a')).toHaveTextContent('RU:First'));
+    // The second item had no translation -> it falls back to its source text.
+    expect(screen.getByTestId('b')).toHaveTextContent('Second');
+
+    // Only the valid translation is persisted — no row with an undefined value.
+    expect(database.saveTranslations).toHaveBeenCalledTimes(1);
+    const saved = database.saveTranslations.mock.calls[0][0];
+    expect(saved).toHaveLength(1);
+    expect(saved[0]).toMatchObject({ content_id: '1', translated_text: 'RU:First' });
+  });
+});
