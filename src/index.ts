@@ -32,6 +32,7 @@ export {
   ViewTranslationProvider,
   useViewTranslation,
   useViewTranslationStatus,
+  useAudarInvalidator,
 } from './core/ViewTranslationProvider';
 
 // Pure cache helpers (exported for testing and advanced consumers)
@@ -40,6 +41,11 @@ export {
   canonicalItemHash,
   buildCacheFromDbResults,
 } from './core/cache';
+
+// Programmatic cache invalidation (framework-agnostic factory). The React hook
+// `useAudarInvalidator` (above) wraps this with config from AudarProvider.
+export { createInvalidator } from './core/invalidation';
+export type { AudarInvalidator } from './core/invalidation';
 
 // Type definitions
 export type {
@@ -52,6 +58,17 @@ export type {
   I18nAdapter,
   AudarConfig,
   UseViewTranslationResult,
+  // v0.2 additions
+  TranslateOptions,
+  TranslationDirectives,
+  RetryConfig,
+  BatchingConfig,
+  AudarEvent,
+  CacheHitEvent,
+  CacheMissEvent,
+  TranslateStartEvent,
+  TranslateSuccessEvent,
+  TranslateErrorEvent,
 } from './types';
 
 // CLI Configuration Types

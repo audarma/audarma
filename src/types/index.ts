@@ -2,10 +2,58 @@
  * Core types for Audar progressive translation system
  */
 
+import type { AudarEvent } from './events';
+
+export type { AudarEvent } from './events';
+export type {
+  CacheHitEvent,
+  CacheMissEvent,
+  TranslateStartEvent,
+  TranslateSuccessEvent,
+  TranslateErrorEvent,
+} from './events';
+
 export interface TranslationItem {
   contentType: string;
   contentId: string;
   text: string;
+}
+
+/**
+ * Per-call options for an LLM translation request.
+ *
+ * All fields are optional. When none are provided the request behaves exactly
+ * as the original three-argument `translateBatch` call, so existing providers
+ * and call sites are unaffected.
+ */
+export interface TranslateOptions {
+  /**
+   * System prompt / instruction prepended to the translation request to steer
+   * tone, domain, or style.
+   */
+  systemPrompt?: string;
+
+  /**
+   * Glossary mapping a source term to its REQUIRED target translation. The
+   * provider should translate these terms exactly as specified.
+   */
+  glossary?: Record<string, string>;
+
+  /**
+   * Terms that MUST survive verbatim in the output (e.g. brand or product
+   * names). The provider should leave these untranslated.
+   */
+  doNotTranslate?: string[];
+
+  /**
+   * Desired formality register of the translation.
+   */
+  formality?: 'formal' | 'informal' | 'neutral';
+
+  /**
+   * Abort signal for timeout / cancellation of the underlying request.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ViewTranslationMetadata {
@@ -69,6 +117,22 @@ export interface DatabaseAdapter {
   ): Promise<void>;
 
   /**
+   * OPTIONAL: Delete cached translation rows matching the given filter.
+   *
+   * Used by the invalidation API to evict stale translations. An undefined
+   * field means "do not constrain on this field" (e.g. omitting `locale`
+   * deletes the matching rows across all locales). An empty filter `{}`
+   * deletes all rows.
+   *
+   * @param filter - Constraints on which rows to delete
+   */
+  deleteTranslations?(filter: {
+    contentType?: string;
+    contentId?: string;
+    locale?: string;
+  }): Promise<void>;
+
+  /**
    * OPTIONAL: Discover all translatable content from source tables
    * Required for CLI batch translation mode
    *
@@ -104,12 +168,16 @@ export interface LLMProvider {
    * @param items - Items to translate
    * @param sourceLocale - Source language code (e.g., 'en')
    * @param targetLocale - Target language code (e.g., 'ru')
+   * @param options - OPTIONAL per-call directives (system prompt, glossary,
+   *   do-not-translate terms, formality, abort signal). Implementations that
+   *   ignore this parameter remain fully compatible.
    * @returns Array of translated texts in same order as input
    */
   translateBatch(
     items: TranslationItem[],
     sourceLocale: string,
-    targetLocale: string
+    targetLocale: string,
+    options?: TranslateOptions
   ): Promise<string[]>;
 }
 
@@ -132,6 +200,80 @@ export interface I18nAdapter {
    * Get list of supported locales
    */
   getSupportedLocales(): string[];
+}
+
+/**
+ * Translation directives applied to every translate request unless overridden
+ * per call. Mirrors the steerable fields of {@link TranslateOptions}.
+ */
+export interface TranslationDirectives {
+  /**
+   * System prompt / instruction to steer tone, domain, or style.
+   */
+  systemPrompt?: string;
+
+  /**
+   * Glossary mapping a source term to its REQUIRED target translation.
+   */
+  glossary?: Record<string, string>;
+
+  /**
+   * Terms that MUST survive verbatim in the output (e.g. brand/product names).
+   */
+  doNotTranslate?: string[];
+
+  /**
+   * Desired formality register of the translation.
+   */
+  formality?: 'formal' | 'informal' | 'neutral';
+}
+
+/**
+ * Retry / timeout policy for translate requests.
+ *
+ * Defaults preserve current behavior: `attempts` defaults to 1 (no retry),
+ * and retries occur ONLY on a thrown error or timeout.
+ */
+export interface RetryConfig {
+  /**
+   * Total number of attempts (including the first). Default 1 (NO retry).
+   */
+  attempts?: number;
+
+  /**
+   * Base delay in milliseconds between retry attempts (used as the basis for
+   * any backoff). Only relevant when `attempts` > 1.
+   */
+  baseDelayMs?: number;
+
+  /**
+   * Per-attempt timeout in milliseconds. A timeout is treated as a thrown
+   * error and triggers a retry (subject to `attempts`).
+   */
+  timeoutMs?: number;
+}
+
+/**
+ * Batching policy for splitting a translate pass into LLM calls.
+ *
+ * Defaults preserve current behavior: a single batch containing all items.
+ */
+export interface BatchingConfig {
+  /**
+   * Maximum number of items per LLM call. Default: all items in one batch.
+   */
+  maxBatchSize?: number;
+
+  /**
+   * Maximum number of batches translated concurrently. Default: 1.
+   */
+  maxConcurrentBatches?: number;
+
+  /**
+   * Minimum interval in milliseconds between batch starts (simple rate
+   * limiting). Default: 0 (no throttling).
+   */
+  minBatchIntervalMs?: number;
 }
 
 /**
@@ -162,6 +304,31 @@ export interface AudarConfig {
    * Enable debug logging
    */
   debug?: boolean;
+
+  /**
+   * OPTIONAL: Translation directives (system prompt, glossary, do-not-translate
+   * terms, formality) applied to translate requests. Default: undefined (no
+   * directives — current behavior).
+   */
+  translation?: TranslationDirectives;
+
+  /**
+   * OPTIONAL: Retry / timeout policy. Default: undefined; `attempts` defaults
+   * to 1 (NO retry). Retries occur ONLY on a thrown error or timeout.
+   */
+  retry?: RetryConfig;
+
+  /**
+   * OPTIONAL: Batching policy. Default: undefined — a single batch containing
+   * all items (current behavior).
+   */
+  batching?: BatchingConfig;
+
+  /**
+   * OPTIONAL: Observability callback invoked for each {@link AudarEvent}.
+   * Default: undefined (no-op — current behavior).
+   */
+  onEvent?: (event: AudarEvent) => void;
 }
 
 /**

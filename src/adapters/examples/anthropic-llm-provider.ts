@@ -14,13 +14,51 @@
  * ```
  */
 
-import type { LLMProvider, TranslationItem } from '../../types';
+import type { LLMProvider, TranslateOptions, TranslationItem } from '../../types';
 
 interface AnthropicConfig {
   apiKey: string;
   model?: string;
   maxTokens?: number;
   temperature?: number;
+}
+
+/**
+ * Build additional instruction lines from the optional per-call directives.
+ * Returns an empty string when no directives are provided, so the prompt is
+ * byte-for-byte identical to the original behavior.
+ */
+function buildDirectiveInstructions(options?: TranslateOptions): string {
+  if (!options) {
+    return '';
+  }
+
+  const lines: string[] = [];
+
+  if (options.glossary && Object.keys(options.glossary).length > 0) {
+    const pairs = Object.entries(options.glossary)
+      .map(([term, translation]) => `"${term}" -> "${translation}"`)
+      .join(', ');
+    lines.push(
+      `Use these exact translations for the following terms: ${pairs}.`
+    );
+  }
+
+  if (options.doNotTranslate && options.doNotTranslate.length > 0) {
+    lines.push(
+      `Keep the following terms verbatim (do NOT translate them): ${options.doNotTranslate.join(', ')}.`
+    );
+  }
+
+  if (options.formality) {
+    lines.push(`Use a ${options.formality} register/formality in the translation.`);
+  }
+
+  if (lines.length === 0) {
+    return '';
+  }
+
+  return `\n\n${lines.join('\n')}`;
 }
 
 interface AnthropicMessage {
@@ -47,14 +85,15 @@ export function createAnthropicProvider(config: AnthropicConfig): LLMProvider {
     async translateBatch(
       items: TranslationItem[],
       sourceLocale: string,
-      targetLocale: string
+      targetLocale: string,
+      options?: TranslateOptions
     ): Promise<string[]> {
       const prompt = `Translate the following texts from ${sourceLocale} to ${targetLocale}.
 
 Input texts (JSON array):
 ${JSON.stringify(items.map((item) => item.text))}
 
-Return ONLY a JSON array of translated strings, in the same order as the input. Do not include any explanations or markdown formatting.`;
+Return ONLY a JSON array of translated strings, in the same order as the input. Do not include any explanations or markdown formatting.${buildDirectiveInstructions(options)}`;
 
       const messages: AnthropicMessage[] = [
         {
@@ -75,7 +114,11 @@ Return ONLY a JSON array of translated strings, in the same order as the input. 
           max_tokens: maxTokens,
           temperature,
           messages,
+          // Caller-supplied systemPrompt is forwarded as the top-level
+          // Anthropic `system` field; omitted entirely when not provided.
+          ...(options?.systemPrompt ? { system: options.systemPrompt } : {}),
         }),
+        ...(options?.signal ? { signal: options.signal } : {}),
       });
 
       if (!response.ok) {

@@ -2,7 +2,7 @@
 
 > LLM-powered translation system for React/Next.js - translate dynamic content with smart caching.
 
-**ALPHA VERSION (0.1.0-alpha.0)** - This is an early extraction from a production app. APIs may change. Contributions welcome!
+**ALPHA VERSION** - This is an early extraction from a production app. APIs may change. Contributions welcome! v0.2 adds Server Component support, steerable translations, retries, cache invalidation, observability, and rate-limit-aware batching (see below).
 
 ## What is Audarma?
 
@@ -27,6 +27,12 @@ With smart caching, you only pay for each translation once - subsequent requests
 - **Batch translation** - Groups multiple items into single LLM calls
 - **React hooks** - Simple, composable API with loading states
 - **Dual-mode operation** - Lazy (on-demand) + CLI (batch pre-translation)
+- **Server Components** - `translateView` from `audarma/server` for the App Router (no client runtime)
+- **Steerable translations** - System prompt, glossary, do-not-translate terms, and formality
+- **Production robustness** - Retries with timeouts; failures fall back to source text
+- **Cache invalidation** - Programmatic eviction via `createInvalidator` / `useAudarInvalidator`
+- **Observability** - `onEvent` callback emitting cache-hit/miss and translate lifecycle events
+- **Rate-limit-aware batching** - Bounded batch size, concurrency, and inter-batch interval
 
 ## Translation Modes
 
@@ -155,6 +161,145 @@ export default function ProductsPage({ products }) {
 }
 ```
 
+## Server Components / App Router
+
+Use `translateView` from the `audarma/server` subpath inside async Server Components, Route Handlers, or Server Actions. It is React-free and has **no** `localStorage` — state lives entirely in the **same DB cache** the lazy provider uses, so a server-side and client-side translation of identical source text share a cache row.
+
+```tsx
+// app/products/page.tsx  (Server Component — no 'use client')
+import { translateView } from 'audarma/server';
+import { config } from '@/lib/audarma-config';
+
+export default async function ProductsPage() {
+  const products = await getProducts();
+
+  const map = await translateView(config, {
+    items: products.map((p) => ({
+      contentType: 'product_title',
+      contentId: p.id,
+      text: p.title,
+    })),
+    targetLocale: 'ru',
+  });
+
+  return (
+    <ul>
+      {products.map((p) => (
+        // map["product_title:42"] -> translated text (or source text on a miss)
+        <li key={p.id}>{map[`product_title:${p.id}`]}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+`translateView(config, args)` returns a `Promise<Record<string, string>>` keyed by `"contentType:contentId"`. `args` accepts `items`, `targetLocale`, and optional `sourceLocale` (defaults to `config.defaultLocale`), `viewName` (for observability events, defaults to `'server'`), and per-call `options` (see below). When `targetLocale === sourceLocale` it is a passthrough — no DB query, no LLM call. It **never throws** on an LLM/DB failure: un-translated items fall back to their source text.
+
+## LLM Translation Options
+
+Set `config.translation` to steer every translate request. These directives are forwarded to your `LLMProvider.translateBatch` as the optional **4th argument** (`options: TranslateOptions`). Per-call `options` (e.g. passed to `translateView`) override the config-level directives; when neither is set, providers see the original 3-argument call shape.
+
+```ts
+// in your AudarConfig
+translation: {
+  systemPrompt: 'You are translating an e-commerce marketplace.',
+  glossary: { 'sneakers': 'кроссовки' },   // source term -> REQUIRED target translation
+  doNotTranslate: ['Audarma', 'iPhone'],    // keep verbatim
+  formality: 'formal',                      // 'formal' | 'informal' | 'neutral'
+}
+```
+
+A provider consumes these via the 4th argument (the bundled example adapters already do this):
+
+```ts
+const provider: LLMProvider = {
+  async translateBatch(items, sourceLocale, targetLocale, options) {
+    const system = [
+      options?.systemPrompt,
+      options?.formality && `Use a ${options.formality} register.`,
+      options?.doNotTranslate?.length &&
+        `Keep verbatim: ${options.doNotTranslate.join(', ')}.`,
+    ].filter(Boolean).join('\n');
+    // ...call your LLM with `system`, `options?.glossary`, and `options?.signal`
+    return translatedTexts; // string[] in the same order as `items`
+  },
+};
+```
+
+## Production Robustness
+
+Set `config.retry` to retry failed (or timed-out) translate requests. Defaults preserve the original behavior: `attempts` is `1` (NO retry), and a retry happens **only** on a thrown error or timeout.
+
+```ts
+retry: {
+  attempts: 3,        // total attempts including the first
+  baseDelayMs: 500,   // basis for backoff between attempts
+  timeoutMs: 10_000,  // per-attempt timeout; a timeout counts as a thrown error
+}
+```
+
+When `timeoutMs` is set, an `AbortSignal` is forwarded to your provider via `options.signal` (unless you supplied your own). If all attempts fail, translation **falls back to source text** rather than throwing — both lazy mode and `translateView` degrade gracefully to passthrough.
+
+## Cache Invalidation
+
+Force-evict stale translations without a source-text change. Use the framework-agnostic factory `createInvalidator(config)` (server actions, route handlers, CLI) or the React hook `useAudarInvalidator()` (client components, reads config from `AudarProvider`).
+
+```tsx
+import { useAudarInvalidator } from 'audarma';
+
+function AdminControls({ product }) {
+  const invalidator = useAudarInvalidator();
+  return (
+    <button onClick={async () => {
+      await invalidator.invalidate('product_title', product.id);        // all locales
+      // await invalidator.invalidate('product_title', product.id, 'ru'); // single locale
+      // await invalidator.invalidateLocale('ru');                        // whole locale
+      invalidator.invalidateView('products-feed', 'ru');                 // localStorage fingerprint only
+    }}>
+      Refresh translation
+    </button>
+  );
+}
+```
+
+- `invalidate(contentType, contentId, locale?)` — delete DB rows for one item (all locales when `locale` is omitted).
+- `invalidateLocale(locale)` — delete all DB rows for a locale.
+- `invalidateView(viewName, locale)` — clear only the `translation_metadata_${viewName}_${locale}` localStorage key so the provider re-checks the DB on its next mount (no-op server-side).
+
+> `invalidate` and `invalidateLocale` require your database adapter to implement the optional `deleteTranslations(filter)` method; they throw a clear error otherwise. `invalidateView` works without it.
+
+## Observability
+
+Set `config.onEvent` to receive a typed `AudarEvent` for each step of a translation pass:
+
+```ts
+onEvent: (event) => {
+  switch (event.type) {
+    case 'cache_hit':        /* { viewName, locale, count } */ break;
+    case 'cache_miss':       /* { viewName, locale, count } */ break;
+    case 'translate_start':  /* { viewName, locale, count, batches } */ break;
+    case 'translate_success':/* { viewName, locale, count, latencyMs } */ break;
+    case 'translate_error':  /* { viewName, locale, attempt, error } */ break;
+  }
+}
+```
+
+Callback errors are swallowed so observability never breaks translation. Note: **token usage and cost are not emitted** — the `LLMProvider.translateBatch` contract returns a plain `string[]` and exposes no usage information.
+
+## Rate-Limit-Aware Batching
+
+Set `config.batching` to split a translate pass into bounded LLM calls. Defaults preserve the original behavior: a single batch containing all items.
+
+```ts
+batching: {
+  maxBatchSize: 50,          // max items per LLM call
+  maxConcurrentBatches: 3,   // batches translated in parallel
+  minBatchIntervalMs: 200,   // min interval between batch starts (simple throttle)
+}
+```
+
+In lazy mode, batches **render progressively** — each batch updates the cache as it resolves, so users see translations stream in rather than waiting for the whole view.
+
 ## Architecture
 
 ### Adapter Pattern
@@ -168,7 +313,7 @@ interface DatabaseAdapter {
 }
 
 interface LLMProvider {
-  translateBatch(items: TranslationItem[], sourceLocale: string, targetLocale: string): Promise<string[]>;
+  translateBatch(items: TranslationItem[], sourceLocale: string, targetLocale: string, options?: TranslateOptions): Promise<string[]>;
 }
 
 interface I18nAdapter {
@@ -218,6 +363,8 @@ CREATE INDEX idx_content_lookup ON content_translations(content_type, content_id
 CREATE INDEX idx_locale ON content_translations(locale);
 ```
 
+For a production Supabase setup (RLS, policies, and the optional `deleteTranslations` support needed by the invalidation API), see [Supabase production setup](./docs/supabase-setup.md).
+
 ## Example Adapters
 
 See `/src/adapters/examples/` for reference implementations:
@@ -246,13 +393,12 @@ This is an **alpha release** extracted from a production app. Here are known lim
 
 ### Current Limitations
 
-1. **No manual cache-invalidation API** - Source-text changes are now detected automatically (each translation stores a hash of its source text and is re-translated when that changes), but there's no API yet to force-purge or bulk-invalidate translations on demand
-2. **No error boundaries** - There is no built-in React error boundary (a failed translation falls back to the source text rather than crashing, but render-time errors are not caught)
-3. **No retry logic** - Failed translations aren't automatically retried
-4. **No cost tracking** - No built-in token counting or cost estimation
-5. **Client-side only** - Server component support needs work
-6. **No streaming** - All translations must complete before returning
-7. **No partial updates** - Can't update cache incrementally
+1. **No error boundaries** - There is no built-in React error boundary (a failed translation falls back to the source text rather than crashing, but render-time errors are not caught)
+2. **No cost tracking** - No built-in token counting or cost estimation. The `onEvent` observability hook reports cache hits/misses and translate latency, but not token usage or cost, because `LLMProvider.translateBatch` returns a plain `string[]` with no usage information
+3. **No streaming** - Individual LLM batches must complete before their text appears (batches do render progressively via `config.batching`, but a single batch is not streamed token-by-token)
+4. **No partial updates** - Can't update cache incrementally
+
+Resolved since the original alpha: manual cache invalidation (`createInvalidator` / `useAudarInvalidator`), retry logic (`config.retry`), Server Component support (`audarma/server`), and observability (`config.onEvent`).
 
 ### Documented Bugs (Fixed in Production)
 
@@ -267,19 +413,26 @@ These bugs were found and fixed in production. The fixes are documented for your
 
 Help us prioritize! Open an issue to vote or propose features.
 
+**Shipped in v0.2**
+
+- [x] Retry logic with timeouts (`config.retry`)
+- [x] Cache invalidation utilities (`createInvalidator` / `useAudarInvalidator`)
+- [x] Server Component support (`audarma/server`)
+- [x] Observability events (`config.onEvent`)
+- [x] Rate-limit-aware batching (`config.batching`)
+- [x] Steerable translations (`config.translation`: system prompt, glossary, do-not-translate, formality)
+- [x] OpenAI adapter example
+
 **Short-term (Community contributions welcome)**
 
-- [ ] Add retry logic with exponential backoff
 - [ ] Add error boundaries and fallback UI
-- [ ] Add cache invalidation utilities
-- [ ] Add OpenAI adapter example
+- [ ] Add exponential backoff strategy options for retries
 - [ ] Add Prisma adapter example
 - [ ] Add cost estimation helpers
 - [ ] Add TypeScript strict mode for examples
 
 **Medium-term**
 
-- [ ] Server component support (RSC)
 - [ ] Streaming translations (show partial results)
 - [ ] Multiple source languages
 - [ ] Translation quality scoring
@@ -329,7 +482,7 @@ Depends on your LLM provider and content volume. With smart caching, you only pa
 
 ### Does it work with server components?
 
-Not yet. Currently designed for client components. Server component support is on the roadmap.
+Yes. Import `translateView` from `audarma/server` inside async Server Components, Route Handlers, or Server Actions, `await` it, and render the returned `"contentType:contentId"` -> text map. It shares the same DB cache as lazy mode (no `localStorage`, no client runtime). See [Server Components / App Router](#server-components--app-router).
 
 ### Can I use it with my existing i18n setup?
 
@@ -338,13 +491,13 @@ Yes! Audarma is designed to complement existing i18n libraries. Use next-intl/re
 ### What if translation quality is bad?
 
 - Try a better LLM model (GPT-4 vs Llama 3.3)
+- Set `config.translation` to steer output: `systemPrompt`, `glossary`, `doNotTranslate`, and `formality` (see [LLM Translation Options](#llm-translation-options))
 - Improve your prompts in the LLM adapter
-- Add context to translation items
 - Use translation quality scoring (roadmap feature)
 
 ### How do I handle content updates?
 
-Content updates are handled automatically. Each cached translation stores a SHA-256 hash of its source text; when the source text changes, the hash no longer matches and the item is re-translated on its next view (lazy mode) or its next CLI run. You only need to delete translations manually if you want to force a re-translation *without* a source change (a bulk-invalidation API is on the roadmap).
+Content updates are handled automatically. Each cached translation stores a SHA-256 hash of its source text; when the source text changes, the hash no longer matches and the item is re-translated on its next view (lazy mode) or its next CLI run. To force a re-translation *without* a source change, use the invalidation API — `createInvalidator(config)` or the `useAudarInvalidator()` hook — to evict the cached rows. See [Cache Invalidation](#cache-invalidation).
 
 ## Support
 

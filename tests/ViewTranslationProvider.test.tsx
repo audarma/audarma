@@ -1,14 +1,17 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, act } from '@testing-library/react';
 import { ReactNode } from 'react';
+import { renderHook } from '@testing-library/react';
 import {
   AudarProvider,
   ViewTranslationProvider,
   useViewTranslation,
+  useAudarInvalidator,
 } from '../src/core/ViewTranslationProvider';
 import { canonicalItemHash, computeViewContentHash } from '../src/core/cache';
 import type {
   AudarConfig,
+  AudarEvent,
   TranslationItem,
   DatabaseAdapter,
   LLMProvider,
@@ -438,5 +441,235 @@ describe('Robustness (provider returns a short/sparse batch)', () => {
     const saved = database.saveTranslations.mock.calls[0][0];
     expect(saved).toHaveLength(1);
     expect(saved[0]).toMatchObject({ content_id: '1', translated_text: 'RU:First' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 12. v0.2 — retry on failure (config.retry)
+// ---------------------------------------------------------------------------
+
+describe('v0.2 retry (config.retry: provider throws once then succeeds)', () => {
+  it('retries translateBatch and renders the item on the second attempt', async () => {
+    // First call rejects, second resolves. withRetry(config.retry) must retry.
+    let calls = 0;
+    const translateBatch = vi.fn(async (items: TranslationItem[]) => {
+      calls += 1;
+      if (calls === 1) {
+        throw new Error('transient LLM failure');
+      }
+      return items.map((i) => `RU:${i.text}`);
+    });
+
+    const config: AudarConfig = {
+      database: {
+        getCachedTranslations: vi.fn(async () => []),
+        saveTranslations: vi.fn(async () => {}),
+      },
+      llm: { translateBatch },
+      i18n: {
+        getCurrentLocale: () => 'ru',
+        getDefaultLocale: () => 'en',
+        getSupportedLocales: () => ['en', 'ru'],
+      },
+      defaultLocale: 'en',
+      // attempts: 2 => one retry. baseDelayMs: 0 keeps the test fast.
+      retry: { attempts: 2, baseDelayMs: 0 },
+    };
+
+    const items = [item('title', '1', 'Hello')];
+
+    render(
+      <Harness config={config} items={items}>
+        <Consumer contentType="title" contentId="1" text="Hello" />
+      </Harness>
+    );
+
+    // Renders once the retried attempt succeeds.
+    await waitFor(() => expect(screen.getByTestId('out')).toHaveTextContent('RU:Hello'));
+    // Called twice: the initial failed attempt + the successful retry.
+    expect(translateBatch).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 13. v0.2 — observability (config.onEvent)
+// ---------------------------------------------------------------------------
+
+describe('v0.2 observability (config.onEvent emits cache_miss + translate_success)', () => {
+  it('emits cache_miss and translate_success with correct counts', async () => {
+    const events: AudarEvent[] = [];
+
+    const config: AudarConfig = {
+      database: {
+        getCachedTranslations: vi.fn(async () => []),
+        saveTranslations: vi.fn(async () => {}),
+      },
+      llm: {
+        translateBatch: vi.fn(async (items: TranslationItem[]) =>
+          items.map((i) => `RU:${i.text}`)
+        ),
+      },
+      i18n: {
+        getCurrentLocale: () => 'ru',
+        getDefaultLocale: () => 'en',
+        getSupportedLocales: () => ['en', 'ru'],
+      },
+      defaultLocale: 'en',
+      onEvent: (e) => {
+        events.push(e);
+      },
+    };
+
+    const items = [item('title', '1', 'Hello'), item('title', '2', 'World')];
+
+    render(
+      <Harness config={config} items={items}>
+        <Consumer contentType="title" contentId="1" text="Hello" testId="a" />
+        <Consumer contentType="title" contentId="2" text="World" testId="b" />
+      </Harness>
+    );
+
+    await waitFor(() => expect(screen.getByTestId('a')).toHaveTextContent('RU:Hello'));
+    await waitFor(() => expect(screen.getByTestId('b')).toHaveTextContent('RU:World'));
+
+    // cache_miss fires for the 2 uncached items.
+    const cacheMiss = events.find((e) => e.type === 'cache_miss');
+    expect(cacheMiss).toBeDefined();
+    expect(cacheMiss).toMatchObject({
+      type: 'cache_miss',
+      viewName: 'feed',
+      locale: 'ru',
+      count: 2,
+    });
+
+    // translate_success fires with the count of successfully translated items
+    // and a numeric latency.
+    const success = events.find((e) => e.type === 'translate_success');
+    expect(success).toBeDefined();
+    expect(success).toMatchObject({
+      type: 'translate_success',
+      viewName: 'feed',
+      locale: 'ru',
+      count: 2,
+    });
+    expect(typeof (success as { latencyMs: number }).latencyMs).toBe('number');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 14. v0.2 — batching (config.batching.maxBatchSize)
+// ---------------------------------------------------------------------------
+
+describe('v0.2 batching (maxBatchSize splits into multiple translateBatch calls)', () => {
+  it('splits uncached items into batches and renders all of them', async () => {
+    const translateBatch = vi.fn(async (items: TranslationItem[]) =>
+      items.map((i) => `RU:${i.text}`)
+    );
+
+    const config: AudarConfig = {
+      database: {
+        getCachedTranslations: vi.fn(async () => []),
+        saveTranslations: vi.fn(async () => {}),
+      },
+      llm: { translateBatch },
+      i18n: {
+        getCurrentLocale: () => 'ru',
+        getDefaultLocale: () => 'en',
+        getSupportedLocales: () => ['en', 'ru'],
+      },
+      defaultLocale: 'en',
+      // 3 items, maxBatchSize 1 => 3 separate translateBatch calls.
+      batching: { maxBatchSize: 1 },
+    };
+
+    const items = [
+      item('title', '1', 'One'),
+      item('title', '2', 'Two'),
+      item('title', '3', 'Three'),
+    ];
+
+    render(
+      <Harness config={config} items={items}>
+        <Consumer contentType="title" contentId="1" text="One" testId="a" />
+        <Consumer contentType="title" contentId="2" text="Two" testId="b" />
+        <Consumer contentType="title" contentId="3" text="Three" testId="c" />
+      </Harness>
+    );
+
+    await waitFor(() => expect(screen.getByTestId('a')).toHaveTextContent('RU:One'));
+    await waitFor(() => expect(screen.getByTestId('b')).toHaveTextContent('RU:Two'));
+    await waitFor(() => expect(screen.getByTestId('c')).toHaveTextContent('RU:Three'));
+
+    // One call per item because maxBatchSize === 1.
+    expect(translateBatch).toHaveBeenCalledTimes(3);
+    // Each call received exactly one item.
+    translateBatch.mock.calls.forEach((call) => {
+      expect(call[0]).toHaveLength(1);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 15. v0.2 — useAudarInvalidator
+// ---------------------------------------------------------------------------
+
+describe('v0.2 useAudarInvalidator', () => {
+  it('invalidate() calls the adapter deleteTranslations with the content filter', async () => {
+    const deleteTranslations = vi.fn(async () => {});
+
+    const config: AudarConfig = {
+      database: {
+        getCachedTranslations: vi.fn(async () => []),
+        saveTranslations: vi.fn(async () => {}),
+        deleteTranslations,
+      },
+      llm: {
+        translateBatch: vi.fn(async (items: TranslationItem[]) =>
+          items.map((i) => i.text)
+        ),
+      },
+      i18n: {
+        getCurrentLocale: () => 'ru',
+        getDefaultLocale: () => 'en',
+        getSupportedLocales: () => ['en', 'ru'],
+      },
+      defaultLocale: 'en',
+    };
+
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <AudarProvider config={config}>{children}</AudarProvider>
+    );
+
+    const { result } = renderHook(() => useAudarInvalidator(), { wrapper });
+
+    // Without a locale -> deletes across all locales (no `locale` key).
+    await act(async () => {
+      await result.current.invalidate('product_title', '42');
+    });
+    expect(deleteTranslations).toHaveBeenCalledTimes(1);
+    expect(deleteTranslations.mock.calls[0][0]).toEqual({
+      contentType: 'product_title',
+      contentId: '42',
+    });
+
+    // With a locale -> constrains to that locale.
+    await act(async () => {
+      await result.current.invalidate('product_title', '42', 'ru');
+    });
+    expect(deleteTranslations).toHaveBeenCalledTimes(2);
+    expect(deleteTranslations.mock.calls[1][0]).toEqual({
+      contentType: 'product_title',
+      contentId: '42',
+      locale: 'ru',
+    });
+  });
+
+  it('throws when used outside AudarProvider', () => {
+    // Suppress the expected React error boundary console noise.
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(() => renderHook(() => useAudarInvalidator())).toThrow(
+      'ViewTranslationProvider must be used within AudarProvider'
+    );
+    spy.mockRestore();
   });
 });
